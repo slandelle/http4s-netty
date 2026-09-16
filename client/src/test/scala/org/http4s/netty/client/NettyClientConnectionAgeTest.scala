@@ -17,16 +17,22 @@
 package org.http4s.netty.client
 
 import cats.effect.IO
+import cats.effect.Resource
+import cats.effect.kernel.Deferred
+import cats.syntax.all._
 import com.comcast.ip4s._
 import munit.catseffect.IOFixture
 import org.http4s.HttpRoutes
 import org.http4s.Request
+import org.http4s.Uri
 import org.http4s.client.Client
 import org.http4s.dsl.io._
 import org.http4s.ember.server.EmberServerBuilder
 import org.http4s.implicits._
 import org.http4s.server.Server
 
+import java.net.ServerSocket
+import java.nio.charset.StandardCharsets
 import scala.concurrent.duration._
 
 class NettyClientConnectionAgeTest extends IOSuite {
@@ -77,5 +83,57 @@ class NettyClientConnectionAgeTest extends IOSuite {
     for {
       r <- c.expect[String](req)
     } yield assertEquals(r, "slow")
+  }
+
+  test("idle connection in pool is proactively closed after max age expires") {
+    val httpResponse =
+      "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok"
+    // Use a raw TCP server so we can observe when the client closes the connection
+    // without triggering any pool acquire/release.
+    val serverSocketR =
+      Resource.make(IO.blocking(new ServerSocket(0)))(ss => IO.blocking(ss.close()))
+    val clientR = NettyClientBuilder[IO].withMaxConnectionAge(2.seconds).resource
+
+    (serverSocketR, clientR, Deferred[IO, Unit].toResource).tupled.use {
+      case (serverSocket, client, clientClosed) =>
+        val port = serverSocket.getLocalPort
+        // Accept one connection and serve a minimal HTTP response, then watch for close
+        Resource
+          .make(IO.blocking(serverSocket.accept()))(socket => IO.blocking(socket.close()))
+          .use { socket =>
+            val in = socket.getInputStream
+            val out = socket.getOutputStream
+            // Read the HTTP request (consume until empty line)
+
+            for {
+              _ <- IO.blocking(in.read(new Array[Byte](4096)))
+              // Send a minimal HTTP/1.1 response
+              _ <- IO.blocking(out.write(httpResponse.getBytes(StandardCharsets.US_ASCII)))
+              _ <- IO.blocking(out.flush())
+              // Now wait for the client to close the connection
+              // read() returns -1 when the peer closes
+              _ <- IO.blocking(in.read()).iterateUntil(_ == -1)
+              // only goes here if in.read returned -1
+              _ <- clientClosed.complete(())
+            } yield ()
+          }
+          .background
+          .use { _ =>
+            for {
+              _ <- client.expect[String](
+                Request[IO](uri = Uri.unsafeFromString(s"http://localhost:$port/test"))
+              )
+              // Connection is idle in the pool. Wait for max age (2s) + buffer.
+              // If proactive eviction works, the client closes the connection during
+              // this sleep — without any acquire to trigger the health check.
+              result <- clientClosed.get
+                .as(true)
+                .timeoutTo(5.seconds, IO.pure(false))
+            } yield assert(
+              result,
+              "expected idle connection to be closed proactively after max age")
+
+          }
+    }
   }
 }

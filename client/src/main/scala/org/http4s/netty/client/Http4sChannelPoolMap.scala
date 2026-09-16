@@ -27,7 +27,9 @@ import fs2.io.net.tls.TLSParameters
 import io.netty.bootstrap.Bootstrap
 import io.netty.channel.Channel
 import io.netty.channel.ChannelFuture
+import io.netty.channel.ChannelHandler
 import io.netty.channel.ChannelHandlerContext
+import io.netty.channel.ChannelInboundHandlerAdapter
 import io.netty.channel.ChannelInitializer
 import io.netty.channel.ChannelPipeline
 import io.netty.channel.ChannelPromise
@@ -43,6 +45,8 @@ import io.netty.handler.codec.http2.Http2StreamChannelBootstrap
 import io.netty.handler.codec.http2.Http2StreamFrameToHttpObjectCodec
 import io.netty.handler.ssl.ApplicationProtocolNames
 import io.netty.handler.ssl.SslHandler
+import io.netty.handler.timeout.IdleState
+import io.netty.handler.timeout.IdleStateEvent
 import io.netty.handler.timeout.IdleStateHandler
 import io.netty.util.AttributeKey
 import io.netty.util.concurrent.Future
@@ -198,17 +202,48 @@ private[client] class Http4sChannelPoolMap[F[_]](
       key: Key,
       config: Http4sChannelPoolMap.Config
   ) extends AbstractChannelPoolHandler {
-    override def channelAcquired(ch: Channel): Unit =
+    override def channelAcquired(ch: Channel): Unit = void {
       logger.trace(s"Connected to $ch for ${key}")
+      ch.attr(Http4sChannelPoolMap.CheckedOut).set(java.lang.Boolean.TRUE)
+      val pipeline = ch.pipeline()
+      if (pipeline.get(Http4sChannelPoolMap.MaxAgeCloserHandlerName) != null)
+        void(pipeline.remove(Http4sChannelPoolMap.MaxAgeCloserHandlerName))
+      if (pipeline.get(Http4sChannelPoolMap.MaxAgeIdleHandlerName) != null)
+        void(pipeline.remove(Http4sChannelPoolMap.MaxAgeIdleHandlerName))
+    }
 
     override def channelCreated(ch: Channel): Unit = void {
       logger.trace(s"Created $ch for ${key}")
       ch.attr(Http4sChannelPoolMap.CreatedAt).set(System.nanoTime())
+      ch.attr(Http4sChannelPoolMap.CheckedOut).set(java.lang.Boolean.TRUE)
       buildPipeline(ch)
     }
 
-    override def channelReleased(ch: Channel): Unit =
+    override def channelReleased(ch: Channel): Unit = void {
       logger.trace(s"Releasing $ch ${key}")
+      ch.attr(Http4sChannelPoolMap.CheckedOut).set(java.lang.Boolean.FALSE)
+      if (config.maxConnectionAge.isFinite) {
+        val createdAt = ch.attr(Http4sChannelPoolMap.CreatedAt).get()
+        if (createdAt != null) {
+          val elapsedNanos = System.nanoTime() - createdAt
+          val remainingNanos = config.maxConnectionAge.toNanos - elapsedNanos
+          val remainingMillis = TimeUnit.NANOSECONDS.toMillis(remainingNanos)
+          if (remainingMillis <= 0) {
+            logger.trace(s"Closing $ch immediately — max connection age already exceeded")
+            void(ch.close())
+          } else {
+            val pipeline = ch.pipeline()
+            pipeline.addFirst(
+              Http4sChannelPoolMap.MaxAgeCloserHandlerName,
+              Http4sChannelPoolMap.MaxAgeCloserHandler)
+            void(
+              pipeline.addFirst(
+                Http4sChannelPoolMap.MaxAgeIdleHandlerName,
+                new IdleStateHandler(0, 0, remainingMillis, TimeUnit.MILLISECONDS)))
+          }
+        }
+      }
+    }
 
     private def buildPipeline(channel: Channel) = {
       logger.trace(s"building pipeline for ${key}")
@@ -276,8 +311,30 @@ private[client] class Http4sChannelPoolMap[F[_]](
 }
 
 private[client] object Http4sChannelPoolMap {
+  private val logger = org.log4s.getLogger
+
   private val CreatedAt: AttributeKey[java.lang.Long] =
     AttributeKey.valueOf("http4s.channel.createdAt")
+  private val CheckedOut: AttributeKey[java.lang.Boolean] =
+    AttributeKey.valueOf("http4s.channel.checkedOut")
+
+  private val MaxAgeIdleHandlerName = "max-age-idle"
+  private val MaxAgeCloserHandlerName = "max-age-closer"
+
+  @ChannelHandler.Sharable
+  private object MaxAgeCloserHandler extends ChannelInboundHandlerAdapter {
+    override def userEventTriggered(ctx: ChannelHandlerContext, evt: AnyRef): Unit =
+      evt match {
+        case e: IdleStateEvent if e.state() == IdleState.ALL_IDLE =>
+          val ch = ctx.channel()
+          val checkedOut = ch.attr(CheckedOut).get()
+          if (checkedOut == null || !checkedOut) {
+            logger.trace(s"Closing connection $ch due to max connection age while idle in pool")
+            void(ch.close())
+          }
+        case _ => super.userEventTriggered(ctx, evt)
+      }
+  }
 
   private def connectionAgeHealthChecker(maxConnectionAge: Duration): ChannelHealthChecker =
     if (!maxConnectionAge.isFinite) ChannelHealthChecker.ACTIVE
